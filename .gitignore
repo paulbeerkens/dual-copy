@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+DualCopyData/
+*.dualcopy-part
+*.dualcopy-meta
+build/
+dist/
+*.spec
+.venv/
+*.exe
+*.log
+.pytest_cache/
+

@@ -1,0 +1,30 @@
+name: Test and build Windows app
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test copy engine and transfer sessions
+        run: |
+          python tests/test_dual_copy.py
+          python tests/test_session.py
+      - name: Install build tools
+        run: python -m pip install -r requirements-build.txt
+      - name: Build executable
+        run: python -m PyInstaller --noconfirm --onefile --windowed --name DualCopy dual_copy.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DualCopy-Windows
+          path: dist/DualCopy.exe

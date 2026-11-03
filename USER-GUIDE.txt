@@ -1,0 +1,61 @@
+DUAL COPY
+
+Double-click DualCopy.exe. It includes Python and Tkinter; no installation needed.
+Keep the executable in a writable folder. Settings and transfer logs are stored
+in the DualCopyData folder beside it. The source version can also be launched
+with Start Dual Copy.bat or python dual_copy.py (requires Python with Tkinter).
+
+The last source, destinations and window size are saved automatically. Every
+run creates a timestamped JSON-lines log of copied/skipped files, link skips,
+errors, retries and a final summary. Open last log opens the current run's log
+after it ends. The final summary appears for success, cancellation and failure.
+Copied counts are per destination; the main completed count counts source files
+that have finished at both destinations. Bytes written include partial work
+and retries. Already-present counts exclude files copied earlier in the run.
+
+Temporary connection and file-busy errors retry up to 12 times, waiting five
+seconds between attempts. Stop safely cancels a retry wait. Each retry rescans
+the source and uses existing completed and partial files; it does not restart
+every file. Other errors (such as disk full or access denied) stop immediately.
+The failure count is terminal operation failures, not a count of all remaining
+files. A network operation already blocked in Windows must return before it
+can be stopped. Logs are retained until you delete them.
+
+Choose a source and TWO separate destination folders. The source folder's
+contents go directly inside each destination. Click Start / Resume.
+
+The app reads a 4 MiB chunk once and writes it to both destinations before
+reading the next chunk. Two worker threads write the chunk in parallel; both
+must finish before the next source read. The slower destination limits the copy.
+Each destination has a current-file progress bar and average write throughput
+in kB/s or MB/s (decimal units), counting only new bytes written during this run.
+The overall speed is combined destination bytes/second, not source read speed.
+Totals count both destination copies. Scanning happens before copying.
+The file counter counts each source file once, after both destinations have it.
+Files already present and matching on both destinations also count as complete.
+Folder counts exclude the selected source root. A folder is complete once all
+files beneath it (including subfolders) are complete at both destinations.
+Empty folders count as complete after destination folders have been created.
+
+Existing files with matching size and modification time are skipped. Changed
+files are replaced only after the new file is fully copied. Extra destination
+files are never deleted. Junctions, symbolic links and other reparse points in
+the source are skipped; destination links are rejected. Empty folders are copied.
+
+Stop safely keeps partial files under .dualcopy-part names, with matching
+.dualcopy-meta sidecars. Start / Resume uses those partials if source size,
+modification time and path still match. Each target can resume at a different
+offset. Do not edit partial files or source files during the transfer. On a
+network failure, automatic retries attempt recovery; after retries are exhausted,
+reconnect and press Start / Resume.
+
+Resume trusts saved partial bytes; it does not hash-verify them. Completed-file
+skipping also uses metadata, not checksums. After a power loss or if integrity
+is uncertain, remove the affected .dualcopy-part and .dualcopy-meta pair to
+force a fresh copy. This app does not preserve ACLs, alternate data streams,
+hard-link relationships, or directory timestamps. File timestamps and basic
+attributes are copied where supported by the destination.
+
+Use actual distinct folders/shares. Different share names or mapped drives can
+refer to the same storage; the app cannot detect all such aliases. Avoid changing
+destination folders or links externally while it runs.
