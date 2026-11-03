@@ -16,6 +16,8 @@ for both writes before reading the next chunk.
 - Saved paths and window size, per-run transfer logs, and a final summary.
 - Skip source junctions and links; reject destination links.
 - Keep extra destination files and copy empty folders.
+- Windows single-instance guard and exclusive transfer ownership.
+- Source-change checks and snapshot-based destination timestamps.
 
 ## Run
 
@@ -53,6 +55,7 @@ manual workflow run. It does not publish a release automatically.
 python tests/test_dual_copy.py
 python tests/test_session.py
 python tests/test_streaming.py
+python tests/test_safety.py
 ```
 
 Tests use temporary local folders, not the configured source/destination paths.
@@ -60,6 +63,17 @@ They cover parallel writes and the read barrier, resume with different offsets,
 skip behavior, file replacement, settings, logs, summaries, retry limits,
 cancellation, recovery from a simulated disconnect during a write, overlapping
 scanning/copying, scanner shutdown, and folder completion with growing totals.
+
+## Exclusive ownership
+
+On Windows, only one instance of this version of Dual Copy can be open at a
+time. Starting another shows a message. A separate transfer guard also rejects
+overlapping engine calls, including concurrent processes. These are nonblocking
+OS named mutexes with process-local thread guards, released on exit or crash.
+They apply across copies of this version on the same Windows computer, including
+other sign-in sessions. They do not protect against old versions, other copy
+tools, or clients on another computer writing to the same share. Close older
+versions before using this one. The guard adds no per-chunk locking.
 
 ## Scanning and progress
 
@@ -83,7 +97,10 @@ Existing files with matching size and modification time are skipped without
 hashing. Changed files are replaced after the new file is fully written. A
 saved partial copy is trusted when its recorded source path, size and timestamp
 still match. This is not checksum verification. Keep source files unchanged
-during copying.
+during copying. Destination timestamps and mode come from the validated source
+snapshot. A source change detected during finalization stops the transfer and
+invalidates the affected partial-copy metadata. A change in the final rename
+window cannot give old contents the new source timestamp.
 
 Each retry rescans the tree and uses completed files and saved partials. There
 are up to 12 retries with five-second waits. A Windows I/O call that is already

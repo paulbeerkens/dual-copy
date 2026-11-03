@@ -1,5 +1,7 @@
 """Two-destination folder copier. Python 3.10+; standard library only."""
 import json
+import ctypes
+from functools import wraps
 import errno
 import os
 import sys
@@ -7,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 import queue
 import re
-import shutil
 import stat
 import threading
 import time
@@ -22,6 +23,67 @@ PART = '.dualcopy-part'
 META = '.dualcopy-meta'
 APP_DIR = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / 'DualCopyData'
+
+
+class AlreadyRunning(RuntimeError):
+    pass
+
+
+_LOCAL_GUARDS = {'app': threading.Lock(), 'transfer': threading.Lock()}
+
+
+class ExclusiveGuard:
+    """Nonblocking Windows named mutex plus a process-local thread guard."""
+    def __init__(self, kind):
+        self.kind = kind
+        self.local = _LOCAL_GUARDS[kind]
+        self.handle = None
+
+    def __enter__(self):
+        if not self.local.acquire(blocking=False):
+            raise AlreadyRunning('Dual Copy is already running. Finish or close the other instance first.')
+        try:
+            if os.name == 'nt':
+                from ctypes import wintypes
+                self.api = ctypes.WinDLL('kernel32', use_last_error=True)
+                self.api.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+                self.api.CreateMutexW.restype = wintypes.HANDLE
+                self.api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+                self.api.WaitForSingleObject.restype = wintypes.DWORD
+                self.api.ReleaseMutex.argtypes = [wintypes.HANDLE]
+                self.api.CloseHandle.argtypes = [wintypes.HANDLE]
+                self.handle = self.api.CreateMutexW(None, False, 'Global\\DualCopy.' + self.kind + '.v1')
+                if not self.handle:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                result = self.api.WaitForSingleObject(self.handle, 0)
+                if result not in (0, 0x80):  # Owned or abandoned by a crashed process.
+                    if result == 0x102:
+                        raise AlreadyRunning('Dual Copy is already running. Finish or close the other instance first.')
+                    raise ctypes.WinError(ctypes.get_last_error())
+            return self
+        except BaseException:
+            if self.handle:
+                self.api.CloseHandle(self.handle)
+                self.handle = None
+            self.local.release()
+            raise
+
+    def __exit__(self, *args):
+        try:
+            if self.handle:
+                self.api.ReleaseMutex(self.handle)
+                self.api.CloseHandle(self.handle)
+                self.handle = None
+        finally:
+            self.local.release()
+
+
+def exclusive_transfer(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with ExclusiveGuard('transfer'):
+            return function(*args, **kwargs)
+    return guarded
 
 
 def load_settings(directory=DATA_DIR):
@@ -158,7 +220,7 @@ def matched(path, info):
         return False
 
 
-FileInfo = namedtuple('FileInfo', 'st_size st_mtime_ns')
+FileInfo = namedtuple('FileInfo', 'st_size st_mtime_ns st_atime_ns st_mode', defaults=(None, None))
 
 
 def scan_source(source, inbox, cancel):
@@ -193,6 +255,7 @@ def scan_source(source, inbox, cancel):
         inbox.put(('error', error))
 
 
+@exclusive_transfer
 def copy_tree(source, targets, emit, stop):
     """Stream discovery while copying; coordinator owns all aggregate counters."""
     source, targets = validate(source, targets)
@@ -318,7 +381,7 @@ def copy_tree(source, targets, emit, stop):
             if not stat.S_ISREG(current.st_mode):
                 raise ValueError(f'Source is no longer a regular file: {src}')
             total += (current.st_size - info.st_size) * 2
-            info = FileInfo(current.st_size, current.st_mtime_ns)
+            info = FileInfo(current.st_size, current.st_mtime_ns, current.st_atime_ns, current.st_mode)
             ensure_folder(rel.parent)
             emit(('file', str(src)))
             pending = []
@@ -415,7 +478,14 @@ def copy_tree(source, targets, emit, stop):
                             meta.unlink(missing_ok=True)
                         raise OSError(f'Source changed during copy; rerun after it stops changing: {src}')
                 for dest, part, meta, _, index in pending:
-                    shutil.copystat(src, part)
+                    # Apply the validated snapshot, never fresh metadata from a changing source.
+                    os.utime(part, ns=(info.st_atime_ns, info.st_mtime_ns))
+                    current = src.stat()
+                    if (current.st_size, current.st_mtime_ns) != (info.st_size, info.st_mtime_ns):
+                        for _, _, sidecar, _, _ in pending:
+                            sidecar.unlink(missing_ok=True)
+                        raise OSError(f'Source changed during finalization; rerun after it stops changing: {src}')
+                    os.chmod(part, stat.S_IMODE(info.st_mode))
                     os.replace(part, dest)
                     meta.unlink(missing_ok=True)
                     destination_progress(index, 'Complete', True)
@@ -692,4 +762,11 @@ if __name__ == '__main__':
         root.destroy()
         Path(sys.argv[2]).write_text('Embedded Python and Tkinter startup passed.\n', encoding='utf-8')
     else:
-        App().mainloop()
+        try:
+            with ExclusiveGuard('app'):
+                App().mainloop()
+        except AlreadyRunning as error:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo('Dual Copy is already open', str(error), parent=root)
+            root.destroy()

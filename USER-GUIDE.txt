@@ -21,6 +21,15 @@ The failure count is terminal operation failures, not a count of all remaining
 files. A network operation already blocked in Windows must return before it
 can be stopped. Logs are retained until you delete them.
 
+Only one instance of this version can run on this Windows computer at a time.
+A second instance shows a message; ownership is released automatically after
+exit or crash. Older versions and other copy tools do not honor this guard.
+Close older copies before starting this version.
+
+Destination timestamps use the validated source snapshot, not a later read of
+the source metadata. Detected changes during finalization stop the copy and
+invalidate affected partial metadata. Retry after the source stops changing.
+
 Choose a source and TWO separate destination folders. The source folder's
 contents go directly inside each destination. Click Start / Resume.
 
