@@ -6,6 +6,7 @@ for both writes before reading the next chunk.
 
 ## Features
 
+- Background scanning through an unbounded queue while copying starts immediately.
 - Overall progress, speed, time remaining, and full source path.
 - A current-file progress bar and write speed for each destination.
 - Live scan totals and completed/remaining file and folder counts.
@@ -51,12 +52,30 @@ manual workflow run. It does not publish a release automatically.
 ```powershell
 python tests/test_dual_copy.py
 python tests/test_session.py
+python tests/test_streaming.py
 ```
 
 Tests use temporary local folders, not the configured source/destination paths.
 They cover parallel writes and the read barrier, resume with different offsets,
 skip behavior, file replacement, settings, logs, summaries, retry limits,
-cancellation, and recovery from a simulated disconnect during a write.
+cancellation, recovery from a simulated disconnect during a write, overlapping
+scanning/copying, scanner shutdown, and folder completion with growing totals.
+
+## Scanning and progress
+
+The scanner uses a separate thread and an unbounded, thread-safe queue of file
+metadata. It never waits for copying to catch up. Destination subfolders are
+created as needed, including empty folders; there is no full-tree preparation
+phase. One coordinator owns aggregate counters and consumes discovery events.
+Worker callbacks are serialized, and only the GUI thread updates widgets.
+
+While scanning, the app shows files/folders found, complete, and pending, with an
+indeterminate overall bar. These are discoveries so far, not final totals. After
+scanning, the bar switches to a percentage and estimated remaining time. The two
+current-file progress bars stay determinate throughout. A folder is complete
+only after its scan is sealed, all child folders and files have finished, and
+both destination directories exist. A stopped/failed scan is clearly marked as
+partial in the summary. Scanners are stopped and joined before retrying.
 
 ## Copy behavior and limitations
 

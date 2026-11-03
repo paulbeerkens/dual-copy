@@ -13,8 +13,9 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from collections import deque, namedtuple
 from contextlib import ExitStack
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 CHUNK = 4 * 1024 * 1024
 PART = '.dualcopy-part'
@@ -59,11 +60,16 @@ def run_transfer(source, targets, emit, stop, directory=DATA_DIR, retry_limit=12
     error_text = ''
     current_file = str(source)
     outcome = 'Stopped'
+    scan_complete = False
     with log_path.open('w', encoding='utf-8', buffering=1) as log:
         def record(action, **details):
             log.write(json.dumps({'time': datetime.now(timezone.utc).isoformat(), 'action': action, **details}) + '\n')
+        event_lock = threading.Lock()
         def receive(event):
-            nonlocal total_files, complete_files, current_file
+            with event_lock:
+                receive_locked(event)
+        def receive_locked(event):
+            nonlocal total_files, complete_files, current_file, scan_complete
             kind = event[0]
             if kind == 'bytes':
                 written[event[1]] += event[2]
@@ -76,6 +82,8 @@ def run_transfer(source, targets, emit, stop, directory=DATA_DIR, retry_limit=12
             if kind == 'log':
                 record(event[1], path=event[2])
                 return
+            if kind == 'scan':
+                scan_complete = event[4]
             if kind == 'files':
                 complete_files, total_files = event[1:]
             if kind == 'file':
@@ -109,7 +117,7 @@ def run_transfer(source, targets, emit, stop, directory=DATA_DIR, retry_limit=12
             record('failed', path=current_file, message=error_text)
         summary = {
             'outcome': outcome, 'elapsed': time.monotonic() - started,
-            'files_complete': complete_files, 'files_total': total_files,
+            'files_complete': complete_files, 'files_total': total_files, 'scan_complete': scan_complete,
             'copied': [len(s) for s in copied],
             'skipped': [len(skipped[i] - copied[i]) for i in range(2)],
             'written': written, 'retries': retries,
@@ -150,189 +158,278 @@ def matched(path, info):
         return False
 
 
+FileInfo = namedtuple('FileInfo', 'st_size st_mtime_ns')
+
+
+def scan_source(source, inbox, cancel):
+    """Scanner sends discoveries through an unbounded queue, never to Tk."""
+    try:
+        stack = [Path('.')]
+        while stack and not cancel.is_set():
+            rel = stack.pop()
+            children = []
+            with os.scandir(source / rel) as entries:
+                for entry in entries:
+                    if cancel.is_set():
+                        return
+                    child = rel / entry.name
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                        inbox.put(('link', child))
+                    elif stat.S_ISDIR(info.st_mode):
+                        inbox.put(('directory', child))
+                        children.append(child)
+                    elif stat.S_ISREG(info.st_mode):
+                        if entry.name.endswith((PART, META)):
+                            raise ValueError('Source contains reserved .dualcopy-part or .dualcopy-meta names.')
+                        inbox.put(('file', child, FileInfo(info.st_size, info.st_mtime_ns)))
+                    else:
+                        raise ValueError(f'Not a regular file: {source / child}')
+            inbox.put(('sealed', rel))
+            stack.extend(reversed(children))
+        if not cancel.is_set():
+            inbox.put(('finished',))
+    except Exception as error:
+        inbox.put(('error', error))
+
+
 def copy_tree(source, targets, emit, stop):
-    """Read one source chunk, write it to each outstanding destination."""
+    """Stream discovery while copying; coordinator owns all aggregate counters."""
     source, targets = validate(source, targets)
-    files, folders = [], [Path('.')]
-    skipped_links = 0
-    def walk_error(error):
-        raise error
-    last_scan_update = 0
-    def scan_progress(path, force=False):
-        nonlocal last_scan_update
-        if stop.is_set():
-            raise Stopped()
-        now = time.monotonic()
-        if force or now - last_scan_update >= .15:
-            # Count subdirectories; the selected source folder is excluded.
-            emit(('scan', len(folders) - 1, len(files), str(path)))
-            last_scan_update = now
-    scan_progress(source, True)
-    for root, dirs, names in os.walk(source, followlinks=False, onerror=walk_error):
-        if stop.is_set():
-            raise Stopped()
-        root = Path(root)
-        for name in dirs[:]:
-            scan_progress(root)
-            p = root / name
-            if linked(p):
-                dirs.remove(name)
-                skipped_links += 1
-                emit(('log', 'link_skipped', str(p)))
-            else:
-                folders.append(p.relative_to(source))
-        for name in names:
-            scan_progress(root)
-            p = root / name
-            if linked(p):
-                skipped_links += 1
-                emit(('log', 'link_skipped', str(p)))
-                continue
-            if name.endswith((PART, META)):
-                raise ValueError('Source contains reserved .dualcopy-part or .dualcopy-meta names.')
-            info = p.stat()
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError(f'Not a regular file: {p}')
-            files.append((p.relative_to(source), info))
-        scan_progress(root)
-    scan_progress(source, True)
-    emit(('status', f'Scan complete · {len(folders) - 1:,} directories · {len(files):,} files. Preparing destinations…'))
-    total = sum(s.st_size for _, s in files) * 2
-    emit(('files', 0, len(files)))
-    folder_remaining = {rel: 0 for rel in folders if rel != Path('.')}
-    for rel, _ in files:
-        for parent in rel.parents:
-            if parent in folder_remaining:
-                folder_remaining[parent] += 1
-    emit(('folders', 0, len(folder_remaining)))
-    done = transferred = 0
+    inbox = queue.Queue()  # Intentionally unbounded: scanner never waits for copying.
+    cancel_scan = threading.Event()
+    scanner = threading.Thread(target=scan_source, args=(source, inbox, cancel_scan),
+                               name='source-scanner', daemon=True)
+    work = deque()
+    root = Path('.')
+    folders = {root: {'pending': 0, 'sealed': False, 'prepared': False, 'complete': False}}
+    total_files = completed_files = completed_folders = skipped_links = 0
+    total = done = transferred = 0
+    scan_finished = False
+    scan_path = str(source)
+    current_path = ''
     start = time.monotonic()
     last = 0
-    def progress(name, force=False):
-        nonlocal last
+
+    def finish_folder(rel):
+        nonlocal completed_folders
+        while True:
+            state = folders[rel]
+            if state['complete'] or not state['sealed'] or not state['prepared'] or state['pending']:
+                return
+            state['complete'] = True
+            if rel == root:
+                return
+            completed_folders += 1
+            rel = rel.parent
+            folders[rel]['pending'] -= 1
+
+    def ensure_folder(rel):
+        chain = list(reversed([rel, *rel.parents]))
+        for part in chain:
+            state = folders[part]
+            if state['prepared']:
+                continue
+            for target in targets:
+                dest = target / part
+                if dest.is_symlink() or (dest.exists() and linked(dest)):
+                    raise ValueError(f'Destination contains a junction or link: {dest}')
+                dest.mkdir(parents=False, exist_ok=True)
+            state['prepared'] = True
+            finish_folder(part)
+
+    def progress(name=None, force=False):
+        nonlocal last, current_path
+        if name is not None:
+            current_path = str(name)
         now = time.monotonic()
         if force or now - last >= .15:
-            emit(('progress', done, total, transferred, now - start, str(name)))
+            emit(('scan', len(folders) - 1, total_files, scan_path, scan_finished))
+            emit(('files', completed_files, total_files))
+            emit(('folders', completed_folders, len(folders) - 1))
+            emit(('progress', done, total, transferred, now - start, current_path))
             last = now
-    # Refuse destination links, including existing ancestor folders.
-    for target in targets:
-        for p in [target, *target.parents]:
-            if p.exists() and linked(p):
-                raise ValueError(f'Destination contains a junction or link: {p}')
-        for rel in folders:
-            p = target / rel
-            if p.exists() and linked(p):
-                raise ValueError(f'Destination contains a junction or link: {p}')
-            p.mkdir(parents=True, exist_ok=True)
-    completed_folders = sum(count == 0 for count in folder_remaining.values())
-    emit(('folders', completed_folders, len(folder_remaining)))
-    for file_number, (rel, info) in enumerate(files, 1):
+
+    def pump():
+        nonlocal total_files, total, scan_path, scan_finished, skipped_links
         if stop.is_set():
             raise Stopped()
-        src = source / rel
-        pending = []
-        file_start = time.monotonic()
-        file_done = [0, 0]
-        file_written = [0, 0]
-        file_update = [0, 0]
-        def destination_progress(index, state='', force=False):
-            now = time.monotonic()
-            if force or now - file_update[index] >= .15:
-                speed = file_written[index] / max(now - file_start, .001)
-                emit(('destination', index, file_done[index], info.st_size, speed, state))
-                file_update[index] = now
-        def write_chunk(writer, data, index):
-            count = writer.write(data)
-            if count != len(data):
-                raise OSError(f'Incomplete write to destination {index + 1}.')
-            file_done[index] += count
-            file_written[index] += count
-            emit(('bytes', index, count))
-            destination_progress(index)
-            return count
-        identity = {'source': str(src), 'size': info.st_size, 'mtime_ns': info.st_mtime_ns}
-        for index, target in enumerate(targets):
-            dest = target / rel
-            part, meta = Path(str(dest) + PART), Path(str(dest) + META)
-            for p in (dest, part, meta):
-                if p.is_symlink() or (p.exists() and linked(p)):
-                    raise ValueError(f'Destination contains a link: {p}')
-            if matched(dest, info):
-                done += info.st_size
-                file_done[index] = info.st_size
-                destination_progress(index, 'Already copied', True)
-                emit(('record', 'skipped', index, str(dest)))
+        deadline = time.monotonic() + .01
+        for _ in range(2000):
+            try:
+                event = inbox.get_nowait()
+            except queue.Empty:
+                break
+            kind = event[0]
+            if kind == 'directory':
+                rel = event[1]
+                folders[rel] = {'pending': 0, 'sealed': False, 'prepared': False, 'complete': False}
+                folders[rel.parent]['pending'] += 1
+                scan_path = str(source / rel)
+            elif kind == 'file':
+                _, rel, info = event
+                total_files += 1
+                total += info.st_size * 2
+                folders[rel.parent]['pending'] += 1
+                work.append(('file', rel, info))
+                scan_path = str(source / rel.parent)
+            elif kind == 'sealed':
+                rel = event[1]
+                folders[rel]['sealed'] = True
+                work.append(('directory', rel, None))
+                finish_folder(rel)
+            elif kind == 'link':
+                skipped_links += 1
+                emit(('log', 'link_skipped', str(source / event[1])))
+            elif kind == 'finished':
+                scan_finished = True
+            elif kind == 'error':
+                raise event[1]
+            if time.monotonic() >= deadline:
+                break
+        progress()
+
+    for target in targets:
+        for p in [target, *target.parents]:
+            if p.is_symlink() or (p.exists() and linked(p)):
+                raise ValueError(f'Destination contains a junction or link: {p}')
+        target.mkdir(parents=True, exist_ok=True)
+    folders[root]['prepared'] = True
+    progress(force=True)
+    scanner.start()
+    try:
+        while True:
+            pump()
+            if not work:
+                if scan_finished:
+                    break
+                if stop.wait(.03):
+                    raise Stopped()
                 continue
-            offset = 0
-            if part.exists() and meta.exists():
-                try:
-                    if json.loads(meta.read_text(encoding='utf-8')) == identity:
-                        offset = min(part.stat().st_size, info.st_size)
-                except (ValueError, UnicodeError):
-                    pass
-            # Save identity before writing; stale partials restart from zero.
-            meta.write_text(json.dumps(identity), encoding='utf-8')
-            pending.append((dest, part, meta, offset, index))
-            done += offset
-            file_done[index] = offset
-            destination_progress(index, 'Resuming' if offset else '', True)
-        if pending:
+            kind, rel, info = work.popleft()
+            if kind == 'directory':
+                ensure_folder(rel)
+                continue
+            src = source / rel
+            # Discovery may be far ahead: refresh metadata before skip/resume decisions.
+            if linked(src):
+                raise ValueError(f'Source became a junction or link after discovery: {src}')
+            current = src.stat()
+            if not stat.S_ISREG(current.st_mode):
+                raise ValueError(f'Source is no longer a regular file: {src}')
+            total += (current.st_size - info.st_size) * 2
+            info = FileInfo(current.st_size, current.st_mtime_ns)
+            ensure_folder(rel.parent)
             emit(('file', str(src)))
-            with ExitStack() as stack:
-                reader = stack.enter_context(src.open('rb'))
-                writers = []
-                for dest, part, meta, offset, index in pending:
-                    writer = stack.enter_context(part.open('r+b' if part.exists() else 'w+b'))
-                    writer.truncate(offset)
-                    writer.seek(offset)
-                    writers.append((writer, offset, index))
-                # ExitStack shuts workers down before it closes their files.
-                pool = stack.enter_context(ThreadPoolExecutor(max_workers=2, thread_name_prefix='destination'))
-                position = min(offset for _, offset, _ in writers)
-                reader.seek(position)
-                while position < info.st_size:
-                    if stop.is_set():
-                        raise Stopped()
-                    chunk = reader.read(min(CHUNK, info.st_size - position))
-                    if not chunk:
-                        raise OSError(f'Source changed or became unreadable: {src}')
-                    end = position + len(chunk)
-                    futures = []
-                    for writer, offset, index in writers:
-                        begin = max(position, offset)
-                        if begin < end:
-                            data = memoryview(chunk)[begin - position:]
-                            futures.append(pool.submit(write_chunk, writer, data, index))
-                    # Both writes must finish before reading another source chunk.
-                    for future in as_completed(futures):
-                        count = future.result()
-                        done += count
-                        transferred += count
-                    position = end
-                    progress(src)
-                for writer, _, _ in writers:
-                    writer.flush()
-                    os.fsync(writer.fileno())
-                current = src.stat()
-                if (current.st_size, current.st_mtime_ns) != (info.st_size, info.st_mtime_ns):
-                    for _, part, meta, _, _ in pending:
-                        meta.unlink(missing_ok=True)
-                    raise OSError(f'Source changed during copy; rerun after it stops changing: {src}')
-            for dest, part, meta, _, index in pending:
-                shutil.copystat(src, part)
-                os.replace(part, dest)
-                meta.unlink(missing_ok=True)
-                destination_progress(index, 'Complete', True)
-                emit(('record', 'copied', index, str(dest)))
-        progress(src, True)
-        emit(('files', file_number, len(files)))
-        for parent in rel.parents:
-            if parent in folder_remaining:
-                folder_remaining[parent] -= 1
-                if folder_remaining[parent] == 0:
-                    completed_folders += 1
-        emit(('folders', completed_folders, len(folder_remaining)))
-    emit(('complete', len(files), skipped_links))
+            pending = []
+            file_start = time.monotonic()
+            file_done = [0, 0]
+            file_written = [0, 0]
+            file_update = [0, 0]
+            def destination_progress(index, state='', force=False):
+                now = time.monotonic()
+                if force or now - file_update[index] >= .15:
+                    speed = file_written[index] / max(now - file_start, .001)
+                    emit(('destination', index, file_done[index], info.st_size, speed, state))
+                    file_update[index] = now
+            def write_chunk(writer, data, index):
+                count = writer.write(data)
+                if count != len(data):
+                    raise OSError(f'Incomplete write to destination {index + 1}.')
+                file_done[index] += count
+                file_written[index] += count
+                emit(('bytes', index, count))
+                destination_progress(index)
+                return count
+            identity = {'source': str(src), 'size': info.st_size, 'mtime_ns': info.st_mtime_ns}
+            for index, target in enumerate(targets):
+                dest = target / rel
+                part, meta = Path(str(dest) + PART), Path(str(dest) + META)
+                for p in (dest, part, meta):
+                    if p.is_symlink() or (p.exists() and linked(p)):
+                        raise ValueError(f'Destination contains a link: {p}')
+                if matched(dest, info):
+                    done += info.st_size
+                    file_done[index] = info.st_size
+                    destination_progress(index, 'Already copied', True)
+                    emit(('record', 'skipped', index, str(dest)))
+                    continue
+                offset = 0
+                if part.exists() and meta.exists():
+                    try:
+                        if json.loads(meta.read_text(encoding='utf-8')) == identity:
+                            offset = min(part.stat().st_size, info.st_size)
+                    except (ValueError, UnicodeError):
+                        pass
+                # Save identity before writing; stale partials restart from zero.
+                meta.write_text(json.dumps(identity), encoding='utf-8')
+                pending.append((dest, part, meta, offset, index))
+                done += offset
+                file_done[index] = offset
+                destination_progress(index, 'Resuming' if offset else '', True)
+            if pending:
+                emit(('file', str(src)))
+                with ExitStack() as stack:
+                    reader = stack.enter_context(src.open('rb'))
+                    writers = []
+                    for dest, part, meta, offset, index in pending:
+                        writer = stack.enter_context(part.open('r+b' if part.exists() else 'w+b'))
+                        writer.truncate(offset)
+                        writer.seek(offset)
+                        writers.append((writer, offset, index))
+                    # ExitStack shuts workers down before it closes their files.
+                    pool = stack.enter_context(ThreadPoolExecutor(max_workers=2, thread_name_prefix='destination'))
+                    position = min(offset for _, offset, _ in writers)
+                    reader.seek(position)
+                    while position < info.st_size:
+                        if stop.is_set():
+                            raise Stopped()
+                        chunk = reader.read(min(CHUNK, info.st_size - position))
+                        if not chunk:
+                            raise OSError(f'Source changed or became unreadable: {src}')
+                        end = position + len(chunk)
+                        futures = []
+                        for writer, offset, index in writers:
+                            begin = max(position, offset)
+                            if begin < end:
+                                data = memoryview(chunk)[begin - position:]
+                                futures.append(pool.submit(write_chunk, writer, data, index))
+                        # Both writes must finish before reading another source chunk.
+                        outstanding = set(futures)
+                        while outstanding:
+                            finished, outstanding = wait(outstanding, timeout=.1, return_when=FIRST_COMPLETED)
+                            for future in finished:
+                                count = future.result()
+                                done += count
+                                transferred += count
+                            pump()
+                            progress(src)
+                        position = end
+                        progress(src)
+                    for writer, _, _ in writers:
+                        writer.flush()
+                        os.fsync(writer.fileno())
+                    current = src.stat()
+                    if (current.st_size, current.st_mtime_ns) != (info.st_size, info.st_mtime_ns):
+                        for _, part, meta, _, _ in pending:
+                            meta.unlink(missing_ok=True)
+                        raise OSError(f'Source changed during copy; rerun after it stops changing: {src}')
+                for dest, part, meta, _, index in pending:
+                    shutil.copystat(src, part)
+                    os.replace(part, dest)
+                    meta.unlink(missing_ok=True)
+                    destination_progress(index, 'Complete', True)
+                    emit(('record', 'copied', index, str(dest)))
+            completed_files += 1
+            folders[rel.parent]['pending'] -= 1
+            finish_folder(rel.parent)
+            progress(src)
+        progress(force=True)
+    finally:
+        cancel_scan.set()
+        scanner.join()  # Join before a retry starts a fresh scanner.
+        progress(force=True)
+    emit(('complete', completed_files, skipped_links))
 
 
 def human(n):
@@ -346,12 +443,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Dual Copy')
-        self.geometry('900x520')
-        self.minsize(780, 520)
+        self.geometry('960x560')
+        self.minsize(850, 560)
         self.events = queue.Queue()
         self.stop = threading.Event()
         self.running = False
         self.fields = []
+        self.scan_finished = False
         self.settings_timer = None
         self.last_log = None
         settings = load_settings()
@@ -393,8 +491,10 @@ class App(tk.Tk):
         self.file_count.grid(row=9, column=0, columnspan=3, sticky='w', pady=(8, 0))
         self.folder_count = ttk.Label(frame, text='Folders complete: 0 · Remaining: —')
         self.folder_count.grid(row=10, column=0, columnspan=3, sticky='w', pady=(6, 0))
+        self.scan_status = ttk.Label(frame, text='', wraplength=880)
+        self.scan_status.grid(row=11, column=0, columnspan=3, sticky='w', pady=(6, 0))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=11, column=0, columnspan=3, sticky='w', pady=12)
+        buttons.grid(row=12, column=0, columnspan=3, sticky='w', pady=12)
         self.start_button = ttk.Button(buttons, text='Start / Resume', command=self.start)
         self.start_button.pack(side='left')
         self.stop_button = ttk.Button(buttons, text='Stop safely', command=self.stop.set, state='disabled')
@@ -456,6 +556,8 @@ class App(tk.Tk):
                       f"Bytes written this run: {human(summary['written'][index])} ({summary['written'][index]:,} bytes)"]
         if summary['error']:
             lines += ['', summary['error']]
+        if not summary.get('scan_complete', False):
+            lines += ['', 'Scan did not finish. File totals show discoveries so far; more files may remain.']
         lines += ['', f"Log: {summary['log']}"]
         window = tk.Toplevel(self)
         window.title('Transfer summary')
@@ -478,7 +580,10 @@ class App(tk.Tk):
         self.running = True
         self.persist_settings()
         self.stop.clear()
-        self.bar['value'] = 0
+        self.scan_finished = False
+        self.bar.configure(mode='indeterminate')
+        self.bar.start(15)
+        self.scan_status['text'] = 'Scanning and copying…'
         self.file_count['text'] = 'Files complete: 0 · Remaining: scanning…'
         self.folder_count['text'] = 'Folders complete: 0 · Remaining: scanning…'
         for bar, label in zip(self.destination_bars, self.destination_stats):
@@ -499,22 +604,32 @@ class App(tk.Tk):
 
     def poll(self):
         try:
-            while True:
+            deadline = time.monotonic() + .025
+            while time.monotonic() < deadline:
                 event = self.events.get_nowait()
                 kind = event[0]
                 if kind == 'status':
                     self.stats['text'] = event[1]
                 elif kind == 'scan':
-                    self.stats['text'] = f'Scanning source… {event[1]:,} directories · {event[2]:,} files found'
-                    self.name['text'] = f'Scanning: {event[3]}'
+                    was_finished = self.scan_finished
+                    self.scan_finished = event[4]
+                    self.scan_status['text'] = (f'Scan complete · {event[1]:,} folders · {event[2]:,} files' if self.scan_finished
+                                                else f'Scanning: {event[3]}')
+                    if was_finished != self.scan_finished:
+                        self.bar.stop()
+                        self.bar.configure(mode='determinate' if self.scan_finished else 'indeterminate')
+                        if not self.scan_finished:
+                            self.bar.start(15)
                 elif kind == 'file':
                     self.name['text'] = f'Copying: {event[1]}'
                 elif kind == 'files':
                     _, completed, total_files = event
-                    self.file_count['text'] = f'Files complete: {completed:,} · Remaining: {total_files - completed:,} · Total: {total_files:,}'
+                    self.file_count['text'] = (f'Files complete: {completed:,} · Remaining: {total_files - completed:,} · Total: {total_files:,}' if self.scan_finished
+                                               else f'Files found: {total_files:,} · Complete: {completed:,} · Pending: {total_files - completed:,} · Scanning…')
                 elif kind == 'folders':
                     _, completed, total_folders = event
-                    self.folder_count['text'] = f'Folders complete: {completed:,} · Remaining: {total_folders - completed:,} · Total: {total_folders:,}'
+                    self.folder_count['text'] = (f'Folders complete: {completed:,} · Remaining: {total_folders - completed:,} · Total: {total_folders:,}' if self.scan_finished
+                                                 else f'Folders found: {total_folders:,} · Complete: {completed:,} · Pending: {total_folders - completed:,} · Scanning…')
                 elif kind == 'destination':
                     _, index, copied, size, speed, state = event
                     percent = copied / size * 100 if size else 100
@@ -526,11 +641,17 @@ class App(tk.Tk):
                     speed = moved / max(elapsed, .001)
                     percent = done / total * 100 if total else 100
                     eta = f'{(total - done) / speed / 60:.1f} min remaining' if speed else 'Estimating…'
-                    self.bar['value'] = percent
-                    self.stats['text'] = f'{percent:.1f}% · {human(done)} / {human(total)} · {human(speed)}/s written · {eta}'
-                    self.name['text'] = f'File: {name}'
+                    if self.scan_finished:
+                        self.bar['value'] = percent
+                        self.stats['text'] = f'{percent:.1f}% · {human(done)} / {human(total)} · {human(speed)}/s written · {eta}'
+                    else:
+                        self.stats['text'] = f'Scanning and copying · {human(moved)} written · {human(speed)}/s · ETA after scan'
+                    if name:
+                        self.name['text'] = f'File: {name}'
                 elif kind in ('summary', 'complete', 'stopped', 'error'):
                     self.running = False
+                    self.bar.stop()
+                    self.bar.configure(mode='determinate')
                     self.start_button['state'] = 'normal'
                     self.stop_button['state'] = 'disabled'
                     for f in self.fields:

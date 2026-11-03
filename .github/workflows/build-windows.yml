@@ -20,6 +20,7 @@ jobs:
         run: |
           python tests/test_dual_copy.py
           python tests/test_session.py
+          python tests/test_streaming.py
       - name: Install build tools
         run: python -m pip install -r requirements-build.txt
       - name: Build executable

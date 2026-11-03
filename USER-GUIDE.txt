@@ -30,12 +30,19 @@ must finish before the next source read. The slower destination limits the copy.
 Each destination has a current-file progress bar and average write throughput
 in kB/s or MB/s (decimal units), counting only new bytes written during this run.
 The overall speed is combined destination bytes/second, not source read speed.
-Totals count both destination copies. Scanning happens before copying.
+Totals count both destination copies. Scanning runs in a separate thread while
+copying starts as soon as work is discovered. Its queue has no size limit.
+Destination folders are created as needed; there is no full preparation stage.
+While scanning, found/pending counts grow and the overall bar is indeterminate.
+After scanning finishes, final totals, overall percentage and ETA are shown.
+Per-destination current-file bars work throughout. Incomplete scans are labeled
+in the final summary; their file totals are discoveries so far.
 The file counter counts each source file once, after both destinations have it.
 Files already present and matching on both destinations also count as complete.
 Folder counts exclude the selected source root. A folder is complete once all
 files beneath it (including subfolders) are complete at both destinations.
-Empty folders count as complete after destination folders have been created.
+Folders count as complete only after their scan and all descendants have
+finished and both destination folders exist. This includes empty folders.
 
 Existing files with matching size and modification time are skipped. Changed
 files are replaced only after the new file is fully copied. Extra destination

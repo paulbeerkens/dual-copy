@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
     targets = [base / 'a', base / 'b']
     stop = threading.Event()
     def interrupt(event):
-        if event[0] == 'progress':
+        if event[0] == 'bytes':
             stop.set()
     try:
         dual.copy_tree(source, targets, interrupt, stop)
